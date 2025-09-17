@@ -6,7 +6,7 @@ metadata:
   labels:
     app: nginx-app
 spec:
-  replicas: 3  # 최소 2개 이상 권장
+  replicas: 5  # 최소 2개 이상 권장
   strategy:
     type: RollingUpdate
     rollingUpdate:

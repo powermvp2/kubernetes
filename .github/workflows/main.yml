@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main, develop ]
     tags:
-      - 'v*.*'  # v로 시작하는 태그
+      - 'v*.*.*'  # v로 시작하는 태그
   pull_request:
     branches: [ main ]
   workflow_dispatch:

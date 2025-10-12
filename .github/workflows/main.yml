@@ -4,9 +4,7 @@ on:
   push:
     branches: [ main, develop ]
     tags:
-      - 'v*.*.*'  # v로 시작하는 태그
-  pull_request:
-    branches: [ main ]
+      - 'v*.*.*'
   workflow_dispatch:
 
 env:
@@ -18,20 +16,38 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
+    # 1단계: 코드 가져오기
     - name: Checkout code
       uses: actions/checkout@v3
     
+    # 2단계: 이미지 태그 결정
     - name: Set image tag
       id: image_tag
       run: |
-        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-          # 태그가 있으면 태그 사용
-          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          # Git 태그가 있으면 태그 사용 (예: v3.0.0)
+          TAG=${GITHUB_REF#refs/tags/}
+          USE_STABLE="true"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "use_stable=$USE_STABLE" >> $GITHUB_OUTPUT
+          echo "📌 Version release: $TAG"
+        elif [[ "${{ github.ref }}" == refs/heads/main ]]; then
+          # main 브랜치면 stable 태그 사용
+          TAG=main-${{ github.sha }}
+          USE_STABLE="true"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "use_stable=$USE_STABLE" >> $GITHUB_OUTPUT
+          echo "📌 Main branch: $TAG + stable"
         else
-          # 태그 없으면 commit SHA 사용
-          echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+          # develop 등 다른 브랜치
+          TAG=dev-${{ github.sha }}
+          USE_STABLE="false"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "use_stable=$USE_STABLE" >> $GITHUB_OUTPUT
+          echo "📌 Development: $TAG"
         fi
     
+    # 3단계: AWS 인증
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
@@ -39,22 +55,47 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
     
+    # 4단계: ECR 로그인
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
     
-    - name: Build, tag, and push image to Amazon ECR
+    # 5단계: Docker 이미지 빌드 및 푸시
+    - name: Build and push Docker image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         IMAGE_TAG: ${{ steps.image_tag.outputs.tag }}
+        USE_STABLE: ${{ steps.image_tag.outputs.use_stable }}
       run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
         
-        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        echo "🔨 Building Docker image..."
+        docker build -t $IMAGE_URI .
         
-    - name: Print image info
+        echo "📤 Pushing image with tag: $IMAGE_TAG"
+        docker push $IMAGE_URI
+        
+        # stable 태그 추가 (main 브랜치 또는 버전 태그일 때)
+        if [[ "$USE_STABLE" == "true" ]]; then
+          echo "🏷️  Tagging as stable..."
+          docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:stable
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:stable
+          echo "✅ Stable tag updated!"
+        fi
+        
+        echo "✅ Image pushed: $IMAGE_URI"
+    
+    # 6단계: 결과 출력
+    - name: Print result
       run: |
-        echo "✅ Image pushed successfully!"
-        echo "Image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image_tag.outputs.tag }}"
+        echo "=========================================="
+        echo "✅ CI Pipeline Success!"
+        echo "=========================================="
+        echo "📦 Image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image_tag.outputs.tag }}"
+        echo "🏷️  Tag: ${{ steps.image_tag.outputs.tag }}"
+        if [[ "${{ steps.image_tag.outputs.use_stable }}" == "true" ]]; then
+          echo "🎯 Stable: YES (stable tag updated)"
+        else
+          echo "🎯 Stable: NO (development only)"
+        fi
+        echo "=========================================="

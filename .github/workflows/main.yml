@@ -3,6 +3,8 @@ name: CI Pipeline
 on:
   push:
     branches: [ main, develop ]
+    tags:
+      - 'v*.*' 
   pull_request:
     branches: [ main ]
   workflow_dispatch:  # 수동 실행 가능

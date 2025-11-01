@@ -1,4 +1,4 @@
-name: CI Pipeline
+name: CI Pipeline with Auto Versioning
 
 on:
   push:
@@ -16,38 +16,46 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    # 1단계: 코드 가져오기
     - name: Checkout code
       uses: actions/checkout@v3
+      with:
+        fetch-depth: 0  # 전체 히스토리 가져오기 (버전 계산에 필요)
     
-    # 2단계: 이미지 태그 결정
-    - name: Set image tag
-      id: image_tag
+    # ⭐ 자동 버전 생성
+    - name: Generate version
+      id: version
       run: |
-        if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-          # Git 태그가 있으면 태그 사용 (예: v3.0.0)
-          TAG=${GITHUB_REF#refs/tags/}
-          USE_STABLE="true"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "use_stable=$USE_STABLE" >> $GITHUB_OUTPUT
-          echo "📌 Version release: $TAG"
-        elif [[ "${{ github.ref }}" == refs/heads/main ]]; then
-          # main 브랜치면 stable 태그 사용
-          TAG=main-${{ github.sha }}
-          USE_STABLE="true"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "use_stable=$USE_STABLE" >> $GITHUB_OUTPUT
-          echo "📌 Main branch: $TAG + stable"
-        else
-          # develop 등 다른 브랜치
-          TAG=dev-${{ github.sha }}
-          USE_STABLE="false"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "use_stable=$USE_STABLE" >> $GITHUB_OUTPUT
-          echo "📌 Development: $TAG"
-        fi
+        # 마지막 태그 가져오기
+        LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        echo "Last tag: $LAST_TAG"
+        
+        # 버전 숫자 추출 (v1.2.3 → 1.2.3)
+        VERSION=${LAST_TAG#v}
+        
+        # Major.Minor.Patch 분리
+        IFS='.' read -ra VERSION_PARTS <<< "$VERSION"
+        MAJOR=${VERSION_PARTS[0]}
+        MINOR=${VERSION_PARTS[1]}
+        PATCH=${VERSION_PARTS[2]}
+        
+        # Patch 버전 자동 증가
+        PATCH=$((PATCH + 1))
+        
+        NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+        echo "New version: $NEW_VERSION"
+        
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "version_number=${MAJOR}.${MINOR}.${PATCH}" >> $GITHUB_OUTPUT
     
-    # 3단계: AWS 인증
+    # ⭐ Git에 새 버전 태그 생성
+    - name: Create Git tag
+      if: github.ref == 'refs/heads/main'
+      run: |
+        git config --global user.name "GitHub Actions Bot"
+        git config --global user.email "actions@github.com"
+        git tag ${{ steps.version.outputs.version }}
+        git push origin ${{ steps.version.outputs.version }}
+    
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
@@ -55,47 +63,66 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
     
-    # 4단계: ECR 로그인
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
     
-    # 5단계: Docker 이미지 빌드 및 푸시
     - name: Build and push Docker image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        IMAGE_TAG: ${{ steps.image_tag.outputs.tag }}
-        USE_STABLE: ${{ steps.image_tag.outputs.use_stable }}
+        VERSION: ${{ steps.version.outputs.version }}
       run: |
-        IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$VERSION
         
-        echo "🔨 Building Docker image..."
+        echo "🔨 Building Docker image with version: $VERSION"
         docker build -t $IMAGE_URI .
         
-        echo "📤 Pushing image with tag: $IMAGE_TAG"
+        # 기존 이미지 삭제 (Immutable 문제 해결)
+        aws ecr batch-delete-image \
+          --repository-name $ECR_REPOSITORY \
+          --image-ids imageTag=$VERSION \
+          --region $AWS_REGION || true
+        
+        echo "📤 Pushing image: $IMAGE_URI"
         docker push $IMAGE_URI
         
-        # stable 태그 추가 (main 브랜치 또는 버전 태그일 때)
-        if [[ "$USE_STABLE" == "true" ]]; then
-          echo "🏷️  Tagging as stable..."
-          docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:stable
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:stable
-          echo "✅ Stable tag updated!"
-        fi
+        # latest 태그도 함께 푸시
+        docker tag $IMAGE_URI $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        aws ecr batch-delete-image \
+          --repository-name $ECR_REPOSITORY \
+          --image-ids imageTag=latest \
+          --region $AWS_REGION || true
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
         
-        echo "✅ Image pushed: $IMAGE_URI"
+        echo "✅ Image pushed with version: $VERSION"
     
-    # 6단계: 결과 출력
+    - name: Update Kubernetes Deployment
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        echo "📝 Updating deployment.yaml with version: $VERSION"
+        sed -i "s|image:.*$ECR_REPOSITORY:.*|image: $ECR_REGISTRY/$ECR_REPOSITORY:$VERSION|g" manifests/nginx-app/deployment.yaml
+        cat manifests/nginx-app/deployment.yaml | grep "image:"
+    
+    - name: Commit and push updated manifest
+      run: |
+        git config --global user.name "GitHub Actions Bot"
+        git config --global user.email "actions@github.com"
+        git add manifests/nginx-app/deployment.yaml
+        if git diff --cached --quiet; then
+          echo "ℹ️  No changes to commit"
+        else
+          git commit -m "🚀 Update deployment to version ${{ steps.version.outputs.version }} [skip ci]"
+          git push origin main
+        fi
+    
     - name: Print result
       run: |
         echo "=========================================="
-        echo "✅ CI Pipeline Success!"
+        echo "✅ CI/CD Pipeline Success!"
         echo "=========================================="
-        echo "📦 Image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image_tag.outputs.tag }}"
-        echo "🏷️  Tag: ${{ steps.image_tag.outputs.tag }}"
-        if [[ "${{ steps.image_tag.outputs.use_stable }}" == "true" ]]; then
-          echo "🎯 Stable: YES (stable tag updated)"
-        else
-          echo "🎯 Stable: NO (development only)"
-        fi
+        echo "🏷️  Version: ${{ steps.version.outputs.version }}"
+        echo "📦 Image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.version }}"
+        echo "📝 Kubernetes manifest updated"
         echo "=========================================="
